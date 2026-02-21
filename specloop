@@ -6,16 +6,20 @@
 #
 # usage:
 #   specloop "add Stripe webhook handler"
-#   specloop "add Stripe webhook handler" 5        # max 5 iterations
-#   specloop "add Stripe webhook handler" 5 1      # bail after 1 stall
+#   specloop "add Stripe webhook handler" --max 5 --stall-limit 1
+#   specloop "add Stripe webhook handler" --skip-interview --model claude-sonnet-4-5-20250929
 #
-# env vars:
-#   MAX=5                    max iterations (default: 3)
-#   STALL_LIMIT=1            stalls before bail (default: 2)
-#   SPEC_DIR=specs           where specs live (default: specs)
-#   MAIN_BRANCH=develop      branch to diff against (default: main)
-#   SKIP_INTERVIEW=1         jump to build-review loop (spec must exist)
-#   MODEL=claude-sonnet-4-5-20250929  model override
+# flags (override env vars):
+#   --max N                  max iterations (default: 3)
+#   --stall-limit N          stalls before bail (default: 2)
+#   --spec-dir DIR           where specs live (default: specs)
+#   --main-branch BRANCH     branch to diff against (default: main)
+#   --skip-interview         jump to build-review loop (spec must exist)
+#   --model MODEL            model override
+#   --help, -h               show usage
+#
+# env var fallbacks:
+#   MAX, STALL_LIMIT, SPEC_DIR, MAIN_BRANCH, SKIP_INTERVIEW, MODEL
 #
 # what happens:
 #   1. creates a feature branch from MAIN_BRANCH
@@ -61,15 +65,94 @@ if ! command -v claude &>/dev/null; then
   exit 1
 fi
 
-FEATURE="${1:?usage: specloop <feature description> [max-iterations] [stall-limit]}"
-SLUG=$(echo "$FEATURE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')
-MAX="${2:-${MAX:-3}}"
-STALL_LIMIT="${3:-${STALL_LIMIT:-2}}"
-MAIN_BRANCH="${MAIN_BRANCH:-main}"
-SKIP_INTERVIEW="${SKIP_INTERVIEW:-0}"
-MODEL="${MODEL:-}"
+# ─────────────────────────────────────────────
+# usage
+# ─────────────────────────────────────────────
+usage() {
+  cat <<EOF
+Usage: specloop <feature-description> [flags]
 
-DIR="${SPEC_DIR:-specs}"
+Flags:
+  --max N              Max build-review iterations (default: 3)
+  --stall-limit N      Consecutive stalls before bailing (default: 2)
+  --spec-dir DIR       Directory for spec artifacts (default: specs)
+  --main-branch BRANCH Branch to diff against (default: main)
+  --skip-interview     Skip interview phase (spec must exist)
+  --model MODEL        Claude model override
+  -h, --help           Show this help
+
+Environment variables (MAX, STALL_LIMIT, SPEC_DIR, MAIN_BRANCH, SKIP_INTERVIEW, MODEL)
+are used as fallbacks when flags are not provided.
+EOF
+}
+
+# ─────────────────────────────────────────────
+# parse args
+# ─────────────────────────────────────────────
+_max="" _stall_limit="" _spec_dir="" _main_branch="" _skip_interview="" _model=""
+FEATURE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --max)
+      _max="${2:?--max requires a value}"
+      shift 2
+      ;;
+    --stall-limit)
+      _stall_limit="${2:?--stall-limit requires a value}"
+      shift 2
+      ;;
+    --spec-dir)
+      _spec_dir="${2:?--spec-dir requires a value}"
+      shift 2
+      ;;
+    --main-branch)
+      _main_branch="${2:?--main-branch requires a value}"
+      shift 2
+      ;;
+    --skip-interview)
+      _skip_interview=1
+      shift
+      ;;
+    --model)
+      _model="${2:?--model requires a value}"
+      shift 2
+      ;;
+    -*)
+      echo "Unknown flag: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      if [ -z "$FEATURE" ]; then
+        FEATURE="$1"
+      else
+        echo "Unexpected argument: $1" >&2
+        usage >&2
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$FEATURE" ]; then
+  usage >&2
+  exit 1
+fi
+
+SLUG=$(echo "$FEATURE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')
+MAX="${_max:-${MAX:-3}}"
+STALL_LIMIT="${_stall_limit:-${STALL_LIMIT:-2}}"
+MAIN_BRANCH="${_main_branch:-${MAIN_BRANCH:-main}}"
+SKIP_INTERVIEW="${_skip_interview:-${SKIP_INTERVIEW:-0}}"
+MODEL="${_model:-${MODEL:-}}"
+
+DIR="${_spec_dir:-${SPEC_DIR:-specs}}"
 mkdir -p "$DIR"
 SPEC="$DIR/${SLUG}.md"
 DECISIONS="$DIR/${SLUG}-decisions.md"

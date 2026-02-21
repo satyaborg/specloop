@@ -48,25 +48,31 @@ Or just run it directly:
 # basic — interview + build + review loop
 specloop "add Stripe webhook handler"
 
-# limit to 5 iterations
-specloop "add Stripe webhook handler" 5
-
 # limit to 5 iterations, bail after 1 stall
-specloop "add Stripe webhook handler" 5 1
+specloop "add Stripe webhook handler" --max 5 --stall-limit 1
+
+# skip interview, use a specific model
+specloop "add Stripe webhook handler" --skip-interview --model claude-sonnet-4-5-20250929
+
+# flags can go before or after the feature description
+specloop --max 5 "add Stripe webhook handler"
+
+# show help
+specloop --help
 ```
 
 ## Configuration
 
-All configuration is via environment variables:
+Flags take precedence over environment variables. Environment variables take precedence over defaults.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MAX` | `3` | Max build-review iterations |
-| `STALL_LIMIT` | `2` | Consecutive stalls before bailing |
-| `SPEC_DIR` | `specs` | Directory for spec artifacts |
-| `MAIN_BRANCH` | `main` | Branch to diff against |
-| `SKIP_INTERVIEW` | `0` | Set to `1` to skip interview (spec must already exist) |
-| `MODEL` | *(default)* | Claude model override |
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--max` | `MAX` | `3` | Max build-review iterations |
+| `--stall-limit` | `STALL_LIMIT` | `2` | Consecutive stalls before bailing |
+| `--spec-dir` | `SPEC_DIR` | `specs` | Directory for spec artifacts |
+| `--main-branch` | `MAIN_BRANCH` | `main` | Branch to diff against |
+| `--skip-interview` | `SKIP_INTERVIEW` | `0` | Skip interview (spec must already exist) |
+| `--model` | `MODEL` | *(default)* | Claude model override |
 
 ## Outputs
 
