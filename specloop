@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# specloop — prover-verifier loop for spec-driven development
+#
+# deps: gum, glow, claude (Claude Code CLI)
+#   brew install gum charmbracelet/tap/glow
+#
+# usage:
+#   specloop "add Stripe webhook handler"
+#   specloop "add Stripe webhook handler" 5        # max 5 iterations
+#   specloop "add Stripe webhook handler" 5 1      # bail after 1 stall
+#
+# env vars:
+#   MAX=5                    max iterations (default: 3)
+#   STALL_LIMIT=1            stalls before bail (default: 2)
+#   SPEC_DIR=specs           where specs live (default: specs)
+#   MAIN_BRANCH=develop      branch to diff against (default: main)
+#   SKIP_INTERVIEW=1         jump to build-review loop (spec must exist)
+#   MODEL=claude-sonnet-4-5-20250929  model override
+#
+# what happens:
+#   1. creates a feature branch from MAIN_BRANCH
+#   2. interviews you to produce a spec (interactive)
+#   3. actor implements the spec (autonomous, headless)
+#   4. critic verifies against the spec (autonomous, no actor context)
+#   5. loops until ACCEPT, UNCLEAR, or stall
+#
+# outputs:
+#   specs/<slug>.md              spec
+#   specs/<slug>-decisions.md    tradeoffs
+#   specs/<slug>-review.md       latest verdict
+#   specs/<slug>-loop.log        actor/critic output log
+#
+# exit codes:
+#   0  accepted
+#   1  needs human input
+#   2  stalled
+
+set -euo pipefail
+
+# ─────────────────────────────────────────────
+# deps — install if missing
+# ─────────────────────────────────────────────
+install_dep() {
+  local cmd="$1" pkg="$2"
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Installing $cmd..."
+    if command -v brew &>/dev/null; then
+      brew install "$pkg"
+    else
+      echo "Install $cmd manually: brew install $pkg" >&2
+      exit 1
+    fi
+  fi
+}
+
+install_dep gum gum
+install_dep glow charmbracelet/tap/glow
+
+if ! command -v claude &>/dev/null; then
+  echo "Install Claude Code: npm install -g @anthropic-ai/claude-code" >&2
+  exit 1
+fi
+
+FEATURE="${1:?usage: specloop <feature description> [max-iterations] [stall-limit]}"
+SLUG=$(echo "$FEATURE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//')
+MAX="${2:-${MAX:-3}}"
+STALL_LIMIT="${3:-${STALL_LIMIT:-2}}"
+MAIN_BRANCH="${MAIN_BRANCH:-main}"
+SKIP_INTERVIEW="${SKIP_INTERVIEW:-0}"
+MODEL="${MODEL:-}"
+
+DIR="${SPEC_DIR:-specs}"
+mkdir -p "$DIR"
+SPEC="$DIR/${SLUG}.md"
+DECISIONS="$DIR/${SLUG}-decisions.md"
+REVIEW="$DIR/${SLUG}-review.md"
+LOG="$DIR/${SLUG}-loop.log"
+STATE="$DIR/${SLUG}-state.json"
+UNCLEAR="$DIR/${SLUG}-unclear.md"
+
+# model flag for claude calls
+MODEL_FLAG=()
+[ -n "$MODEL" ] && MODEL_FLAG=(--model "$MODEL")
+
+prev_fails=999
+stall_count=0
+start_iteration=1
+
+# ─────────────────────────────────────────────
+# resume from saved state if exists
+# ─────────────────────────────────────────────
+if [ -f "$STATE" ]; then
+  saved_iter=$(grep -o '"iteration":[0-9]*' "$STATE" 2>/dev/null | cut -d: -f2 || echo "")
+  saved_stall=$(grep -o '"stall_count":[0-9]*' "$STATE" 2>/dev/null | cut -d: -f2 || echo "")
+  saved_fails=$(grep -o '"prev_fails":[0-9]*' "$STATE" 2>/dev/null | cut -d: -f2 || echo "")
+  if [ -n "$saved_iter" ]; then
+    if gum confirm "Resume from iteration $saved_iter?"; then
+      start_iteration="$saved_iter"
+      stall_count="${saved_stall:-0}"
+      prev_fails="${saved_fails:-999}"
+      SKIP_INTERVIEW=1
+    else
+      rm -f "$STATE"
+    fi
+  fi
+fi
+
+# ─────────────────────────────────────────────
+# cleanup on exit
+# ─────────────────────────────────────────────
+cleanup() {
+  rm -f "$DIR/${SLUG}-interview-prompt.md"
+}
+trap cleanup EXIT INT TERM
+
+# ─────────────────────────────────────────────
+# helpers
+# ─────────────────────────────────────────────
+header() {
+  echo ""
+  gum style --border rounded --padding "0 2" --border-foreground 212 "$1"
+  echo ""
+}
+
+info()  { gum log --level info  "$@"; }
+warn()  { gum log --level warn  "$@"; }
+err()   { gum log --level error "$@"; }
+
+save_state() {
+  local iter="$1"
+  cat > "$STATE" <<EOF
+{"iteration":$iter,"stall_count":$stall_count,"prev_fails":$prev_fails}
+EOF
+}
+
+count_fails() {
+  grep -c "| FAIL |" "$REVIEW" 2>/dev/null || echo 0
+}
+
+extract_unclear_items() {
+  {
+    grep -E "\| (FAIL|UNTESTED) \|" "$REVIEW" 2>/dev/null || true
+    echo ""
+    echo "Flags:"
+    awk '/^\| Issue/,/^$/' "$REVIEW" 2>/dev/null || true
+  }
+}
+
+# headless claude call — logs and streams output
+run_headless() {
+  local label="$1" tools="$2" prompt="$3"
+  echo "" >> "$LOG"
+  echo "── $label $(date -u +%H:%M:%S) ──" >> "$LOG"
+  claude -p "$prompt" "${MODEL_FLAG[@]}" \
+    --allowedTools "$tools" \
+    --dangerously-skip-permissions \
+    2>&1 | tee -a "$LOG"
+}
+
+# ─────────────────────────────────────────────
+# interview (interactive — user talks to claude)
+# ─────────────────────────────────────────────
+interview() {
+  local mode="$1" # "initial" or "clarify"
+  local context="${2:-}"
+  local prompt_file="$DIR/${SLUG}-interview-prompt.md"
+
+  if [ "$mode" = "initial" ]; then
+    header "Interview: $FEATURE"
+    cat > "$prompt_file" <<PROMPT
+Interview me using AskUserQuestion to build a complete implementation spec for: $FEATURE
+
+## Interview approach
+- Use AskUserQuestion for EVERY question — do not ask questions via plain text output
+- Start with the goal and core constraint — what must be true for this to succeed?
+- Probe layers: user-facing behavior → data model → edge cases → failure modes → tradeoffs accepted
+- Ask questions that expose hidden assumptions — don't ask what I've already stated or what's obvious from context
+- When I give a vague answer, push for concrete examples or acceptance criteria
+- Surface contradictions between stated goals and implied constraints
+- Ask about what I'm explicitly NOT building (scope boundaries)
+- One focused question at a time
+
+## Completion criteria
+Stop interviewing when you can answer these without guessing:
+1. What does the happy path look like end-to-end?
+2. What are the key failure/edge cases and how should they behave?
+3. What are the hard constraints vs preferences?
+4. What's out of scope?
+
+## Output
+Write the spec to $SPEC
+If tradeoffs or ambiguity were resolved, write those to $DECISIONS
+
+## When done
+After writing the spec, say "Spec written — exiting interview." and then run /exit to return control to specloop.
+PROMPT
+  else
+    header "Clarifying ambiguities"
+    cat > "$prompt_file" <<PROMPT
+The spec at $SPEC has ambiguities that need resolving. Interview me using AskUserQuestion to clarify ONLY the following issues, then update the spec.
+
+## Unresolved issues
+$context
+
+## Rules
+- Use AskUserQuestion for EVERY question — do not ask questions via plain text output
+- Read the existing spec first
+- Ask only about the issues listed above — do not re-interview the whole feature
+- One question at a time
+- Update $SPEC in place with the clarifications
+- Update $DECISIONS if new tradeoffs were made
+- Do NOT rewrite sections that aren't affected
+
+## When done
+After updating the spec, say "Spec updated — exiting interview." and then run /exit to return control to specloop.
+PROMPT
+  fi
+
+  # interactive claude — user answers questions via AskUserQuestion tool
+  # NOT claude -p: the interview requires back-and-forth
+  gum style --faint "Type /exit if Claude doesn't exit automatically after writing the spec."
+  claude "${MODEL_FLAG[@]}" --allowedTools "Read,Write,AskUserQuestion" < "$prompt_file"
+}
+
+# ─────────────────────────────────────────────
+# build actor prompt based on current state
+# ─────────────────────────────────────────────
+build_actor_prompt() {
+  if [ -f "$REVIEW" ] && grep -q "| FAIL |" "$REVIEW"; then
+    local fixes
+    fixes=$(awk '/^[0-9]+\./,0' "$REVIEW")
+    cat <<EOF
+You are implementing fixes for spec $SPEC.
+
+Fix instructions:
+$fixes
+
+Rules:
+- Address ONLY the listed issues. Do not refactor unrelated code.
+- Run all tests before finishing.
+- Commit with message: 'fix(${SLUG}): address review feedback'
+- If a fix instruction is ambiguous, write your question to $UNCLEAR and stop.
+EOF
+  else
+    cat <<EOF
+Implement the spec at $SPEC. Run tests.
+Commit with message: 'feat(${SLUG}): initial implementation'
+If anything in the spec is ambiguous, write questions to $UNCLEAR and stop.
+EOF
+  fi
+}
+
+# ─────────────────────────────────────────────
+# main
+# ─────────────────────────────────────────────
+header "specloop"
+
+# create feature branch
+SHORT_SLUG=$(echo "$SLUG" | cut -d- -f1-4)
+BRANCH="specloop/${SHORT_SLUG}"
+CURRENT_BRANCH=$(git branch --show-current)
+if [ "$CURRENT_BRANCH" != "$BRANCH" ]; then
+  if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+    err "Uncommitted changes — commit or stash before running specloop"
+    exit 1
+  fi
+  if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    info "Switching to existing branch $BRANCH"
+    git checkout "$BRANCH"
+  else
+    info "Creating branch $BRANCH from $MAIN_BRANCH"
+    git checkout -b "$BRANCH" "$MAIN_BRANCH"
+  fi
+fi
+
+# phase 1: interview
+if [ "$SKIP_INTERVIEW" = "0" ]; then
+  interview "initial"
+
+  if [ ! -f "$SPEC" ]; then
+    err "Interview didn't produce a spec"
+    exit 1
+  fi
+
+  info "Spec written" spec="$SPEC"
+elif [ ! -f "$SPEC" ]; then
+  err "No spec found at $SPEC — run without SKIP_INTERVIEW first"
+  exit 1
+else
+  info "Using existing spec" spec="$SPEC"
+fi
+
+echo ""
+
+# init log
+echo "=== specloop: $FEATURE ===" >> "$LOG"
+echo "=== $(date -u +"%Y-%m-%dT%H:%M:%SZ") ===" >> "$LOG"
+
+# phase 2: prover-verifier loop
+for i in $(seq "$start_iteration" "$MAX"); do
+  gum style --faint "── iteration $i / $MAX ──"
+  save_state "$i"
+
+  PRE_SHA=$(git rev-parse HEAD)
+
+  # actor
+  header "Actor: Building..."
+  rm -f "$UNCLEAR"
+  run_headless "actor" "Read,Write,Bash" "$(build_actor_prompt)"
+
+  # check if actor had questions
+  if [ -f "$UNCLEAR" ]; then
+    warn "Actor has questions"
+    gum style --faint "$(cat "$UNCLEAR")"
+    echo ""
+    interview "clarify" "$(cat "$UNCLEAR")"
+    rm -f "$UNCLEAR"
+
+    # retry actor after clarification
+    header "Actor: Retrying build..."
+    rm -f "$UNCLEAR"
+    run_headless "actor retry" "Read,Write,Bash" "$(build_actor_prompt)"
+
+    if [ -f "$UNCLEAR" ]; then
+      err "Still unclear after re-interview"
+      gum style --faint "$(cat "$UNCLEAR")"
+      save_state "$i"
+      exit 1
+    fi
+  fi
+
+  POST_SHA=$(git rev-parse HEAD)
+  COMMIT_COUNT=$(git log --oneline "$PRE_SHA".."$POST_SHA" 2>/dev/null | wc -l | tr -d ' ')
+  info "$COMMIT_COUNT commit(s)"
+
+  # critic
+  rm -f "$REVIEW"
+  header "Critic: Reviewing against spec..."
+  run_headless "critic" "Read,Bash,Write" "You are a spec verifier. You have NO context about why decisions were made — only the spec and the code. If a decision is not justified by the spec or decisions log, flag it.
+
+Inputs — read fully before reviewing:
+1. Spec: $SPEC
+2. Decisions log (if exists): $DECISIONS
+3. Cumulative diff against $MAIN_BRANCH: run 'git diff $MAIN_BRANCH'
+   (this includes all changes across iterations — review the final state, not individual commits)
+
+For each acceptance criterion in the spec:
+
+| Criterion | Verdict | Evidence | Test |
+|-----------|---------|----------|------|
+| Quote verbatim | PASS / FAIL / UNTESTED | File + line, or what is missing | Test name or NONE |
+
+Flags:
+
+| Issue | Type | Location |
+|-------|------|----------|
+| Description | silent decision / scope drift / missing test | File + line |
+
+Write to $REVIEW
+
+Summary line: X/Y PASS | Z FAIL | W UNTESTED
+
+If REJECT, end with numbered fix instructions — standalone, no context assumed.
+
+End with exactly one of: **ACCEPT** | **REJECT** | **UNCLEAR**"
+
+  # check review file exists
+  if [ ! -f "$REVIEW" ]; then
+    err "Critic didn't produce a review — check $LOG"
+    save_state "$i"
+    exit 1
+  fi
+
+  # parse verdict
+  VERDICT=$(grep -oE "ACCEPT|REJECT|UNCLEAR" "$REVIEW" 2>/dev/null | tail -1 || echo "UNKNOWN")
+  SUMMARY=$(grep -E "^[0-9]+/[0-9]+ PASS" "$REVIEW" 2>/dev/null || echo "")
+
+  case "$VERDICT" in
+    ACCEPT)
+      echo ""
+      gum style --bold --foreground 82 "🟢 ACCEPTED"
+      [ -n "$SUMMARY" ] && gum style --faint "$SUMMARY"
+      echo ""
+      glow "$REVIEW"
+      rm -f "$STATE"
+      echo ""
+      header "Getting started"
+      run_headless "summary" "Read,Bash" \
+        "Read $SPEC and the code changes (git diff $MAIN_BRANCH). In 3-5 lines, tell the user how to install, configure, and use what was just built. Show concrete commands. No preamble."
+      exit 0
+      ;;
+
+    UNCLEAR)
+      echo ""
+      gum style --bold --foreground 214 "🟡 UNCLEAR"
+      [ -n "$SUMMARY" ] && gum style --faint "$SUMMARY"
+      echo ""
+      glow "$REVIEW"
+      echo ""
+      if gum confirm "Re-interview to clarify?"; then
+        interview "clarify" "$(extract_unclear_items)"
+        continue
+      else
+        save_state "$((i + 1))"
+        exit 1
+      fi
+      ;;
+
+    REJECT)
+      [ -n "$SUMMARY" ] && gum style --faint "$SUMMARY"
+
+      current_fails=$(count_fails)
+
+      if [ "$current_fails" -ge "$prev_fails" ]; then
+        stall_count=$((stall_count + 1))
+        warn "No improvement ($current_fails fails) — stall $stall_count/$STALL_LIMIT"
+      else
+        stall_count=0
+        info "$prev_fails → $current_fails fails"
+      fi
+
+      if [ "$stall_count" -ge "$STALL_LIMIT" ]; then
+        echo ""
+        gum style --bold --foreground 196 "🔴 STALLED"
+        echo ""
+        glow "$REVIEW"
+        save_state "$((i + 1))"
+        exit 2
+      fi
+
+      prev_fails=$current_fails
+      ;;
+
+    *)
+      err "Unexpected verdict: $VERDICT"
+      err "Check log: $LOG"
+      [ -f "$REVIEW" ] && glow "$REVIEW"
+      save_state "$i"
+      exit 1
+      ;;
+  esac
+done
+
+echo ""
+gum style --bold --foreground 196 "🔴 MAX ITERATIONS"
+glow "$REVIEW"
+rm -f "$STATE"
+exit 2
