@@ -6,12 +6,12 @@ Spec-driven development on autopilot. Claude Code interviews you, writes the spe
 
 ## How it works
 
-```
-You ──→ Interview ──→ Spec ──→ Actor (build) ──→ Critic (verify) ──┐
-                                    ↑                               │
-                                    └── REJECT ─────────────────────┘
-                                        ACCEPT → done
-                                        UNCLEAR → re-interview → retry
+```mermaid
+flowchart LR
+    You --> Interview --> Spec --> Actor["Actor (build)"] --> Critic["Critic (verify)"]
+    Critic -- REJECT --> Actor
+    Critic -- ACCEPT --> Done
+    Critic -- UNCLEAR --> Interview
 ```
 
 1. **Branch** — creates a feature branch from your main branch
