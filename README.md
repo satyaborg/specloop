@@ -92,14 +92,14 @@ Each run produces artifacts in `specs/`:
 | Tool | What it is | Spec phase | Build-review loop | Runs headless | Open source |
 |------|-----------|------------|-------------------|---------------|-------------|
 | **specloop** | CLI wrapping Claude Code | Interactive interview → spec | Actor builds, independent critic verifies, loops until accept | Yes | Yes |
-| [Ralph Loop](https://github.com/frankbria/ralph-claude-code) | Claude Code plugin | None — uses a task markdown file as persistent memory | Single agent re-reads its own output each iteration; no separate verifier | Yes | Yes |
-| [Smart Ralph](https://github.com/tzachbon/smart-ralph) | Claude Code plugin | Adds spec layer on top of Ralph loop | Ralph-style loop with spec context | Yes | Yes |
-| [OpenSpec](https://github.com/Fission-AI/OpenSpec) | Lightweight SDD framework | `/opsx:new` → proposal → specs → design → tasks | No autonomous loop — human drives each phase | No | Yes |
-| [GitHub Spec Kit](https://github.com/github/spec-kit) | Spec templates + CLI | Constitution → Specify → Plan → Tasks (4 gated phases) | No loop — human reviews between phases | No | Yes |
-| [Kiro](https://kiro.dev/) | AWS agentic IDE (VS Code fork) | Requirements → design → tasks (structured phases) | Agent hooks trigger on events; no explicit actor-critic loop | No | No (free preview) |
-| [BMAD Method](https://github.com/bmad-code-org/BMAD-METHOD) | Multi-agent framework | 21 specialized agents for planning | Agentic planning then context-engineered dev; no verifier loop | Partially | Yes |
+| [Ralph Loop](https://github.com/frankbria/ralph-claude-code) | Standalone CLI wrapping Claude Code | Markdown files as persistent memory (goals, specs, progress) | Single agent; fresh context each iteration, reads file-based memory; no separate verifier | Yes | Yes |
+| [Smart Ralph](https://github.com/tzachbon/smart-ralph) | Claude Code plugin | Five-phase spec pipeline (research → requirements → design → tasks → execution) | Self-contained loop with internal stop-hook (no Ralph dependency since v3.0) | Yes | Yes |
+| [OpenSpec](https://github.com/Fission-AI/OpenSpec) | Lightweight SDD framework | Structured phases: proposal → specs → design → tasks | No autonomous loop — human drives each phase | No | Yes |
+| [GitHub Spec Kit](https://github.com/github/spec-kit) | Spec templates + CLI | Constitution → Specify → Plan → Tasks → Implement (5 phases with quality gates) | No loop — human reviews between phases | No | Yes |
+| [Kiro](https://kiro.dev/) | AWS agentic IDE (Code OSS fork) | Requirements → design → tasks (structured phases) | Agent hooks trigger on events; no explicit actor-critic loop | No | No (freemium) |
+| [BMAD Method](https://github.com/bmad-code-org/BMAD-METHOD) | Multi-agent method | 21 specialized agents across full lifecycle | Agentic planning then context-engineered dev; no verifier loop | Partially | Yes |
 | [Tessl](https://tessl.io/) | Agent enablement platform | Framework for specs + registry of 10k+ library specs | No autonomous loop — specs guide agents | No | Partially |
-| [Aider](https://aider.chat/) (architect mode) | Terminal coding assistant | Architect model proposes, editor model implements | Two-model split but no independent critic; human reviews diffs | No | Yes |
+| [Aider](https://aider.chat/) (architect mode) | Terminal coding assistant | Architect model proposes, editor model implements | Two-model split but no independent critic; human reviews diffs | Partially | Yes |
 | [Devin](https://devin.ai/) | Autonomous AI engineer | Takes tickets from Slack/Jira | Autonomous execution, submits PRs; no spec-first workflow | Yes | No |
 
 **Key differentiator**: specloop is the only tool that combines an interactive interview phase with a fully autonomous actor-critic loop where the verifier has zero context from the builder — closer to [CEGIS](https://en.wikipedia.org/wiki/Counterexample-guided_abstraction_refinement) than a chat-based workflow.
